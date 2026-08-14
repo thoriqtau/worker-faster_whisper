@@ -177,6 +177,7 @@ class Predictor:
         results = {
             "segments": serialize_segments(segments),
             "detected_language": info.language,
+            "duration": info.duration,
             "transcription": transcription_output,
             "translation": translation_output,
             "device": "cuda" if rp_cuda.is_available() else "cpu",
