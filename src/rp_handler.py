@@ -5,6 +5,7 @@ rp_debugger:
 - Utility that provides additional debugging information.
 The handler must be called with --rp_debugger flag to enable it.
 """
+
 import base64
 import tempfile
 
@@ -14,13 +15,21 @@ from runpod.serverless.utils.rp_validator import validate
 import runpod
 import predict
 
-
 MODEL = predict.Predictor()
 MODEL.setup()
 
 
+def report_progress(job, percentage, message):
+    progress = {
+        "percentage": max(0, min(99, int(percentage))),
+        "message": message,
+    }
+
+    runpod.serverless.progress_update(job, progress)
+
+
 def base64_to_tempfile(base64_file: str) -> str:
-    '''
+    """
     Convert base64 file to tempfile.
 
     Parameters:
@@ -28,7 +37,7 @@ def base64_to_tempfile(base64_file: str) -> str:
 
     Returns:
     str: Path to tempfile
-    '''
+    """
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
         temp_file.write(base64.b64decode(base64_file))
 
@@ -37,7 +46,7 @@ def base64_to_tempfile(base64_file: str) -> str:
 
 @rp_debugger.FunctionTimer
 def run_whisper_job(job):
-    '''
+    """
     Run inference on the model.
 
     Parameters:
@@ -45,30 +54,37 @@ def run_whisper_job(job):
 
     Returns:
     dict: The result of the prediction
-    '''
-    job_input = job['input']
+    """
+    job_input = job["input"]
 
-    with rp_debugger.LineTimer('validation_step'):
+    with rp_debugger.LineTimer("validation_step"):
         input_validation = validate(job_input, INPUT_VALIDATIONS)
 
-        if 'errors' in input_validation:
-            return {"error": input_validation['errors']}
-        job_input = input_validation['validated_input']
+        if "errors" in input_validation:
+            return {"error": input_validation["errors"]}
+        job_input = input_validation["validated_input"]
+        report_progress(job, 3, "Input valid")
 
-    if not job_input.get('audio', False) and not job_input.get('audio_base64', False):
-        return {'error': 'Must provide either audio or audio_base64'}
+    if not job_input.get("audio", False) and not job_input.get("audio_base64", False):
+        return {"error": "Must provide either audio or audio_base64"}
 
-    if job_input.get('audio', False) and job_input.get('audio_base64', False):
-        return {'error': 'Must provide either audio or audio_base64, not both'}
+    if job_input.get("audio", False) and job_input.get("audio_base64", False):
+        return {"error": "Must provide either audio or audio_base64, not both"}
 
-    if job_input.get('audio', False):
-        with rp_debugger.LineTimer('download_step'):
-            audio_input = download_files_from_urls(job['id'], [job_input['audio']])[0]
+    if job_input.get("audio", False):
+        report_progress(job, 5, "Download audio")
 
-    if job_input.get('audio_base64', False):
-        audio_input = base64_to_tempfile(job_input['audio_base64'])
+        with rp_debugger.LineTimer("download_step"):
+            audio_input = download_files_from_urls(job["id"], [job_input["audio"]])[0]
 
-    with rp_debugger.LineTimer('prediction_step'):
+    if job_input.get("audio_base64", False):
+        report_progress(job, 5, "Decode audio base64")
+
+        audio_input = base64_to_tempfile(job_input["audio_base64"])
+
+    report_progress(job, 10, "Audio is already")
+
+    with rp_debugger.LineTimer("prediction_step"):
         whisper_results = MODEL.predict(
             audio=audio_input,
             model_name=job_input["model"],
@@ -84,16 +100,21 @@ def run_whisper_job(job):
             suppress_tokens=job_input.get("suppress_tokens", "-1"),
             initial_prompt=job_input["initial_prompt"],
             condition_on_previous_text=job_input["condition_on_previous_text"],
-            temperature_increment_on_fallback=job_input["temperature_increment_on_fallback"],
+            temperature_increment_on_fallback=job_input[
+                "temperature_increment_on_fallback"
+            ],
             compression_ratio_threshold=job_input["compression_ratio_threshold"],
             logprob_threshold=job_input["logprob_threshold"],
             no_speech_threshold=job_input["no_speech_threshold"],
             enable_vad=job_input["enable_vad"],
-            word_timestamps=job_input["word_timestamps"]
+            word_timestamps=job_input["word_timestamps"],
+            progress_callback=lambda percentage, message: report_progress(
+                job, percentage, message
+            )
         )
 
-    with rp_debugger.LineTimer('cleanup_step'):
-        rp_cleanup.clean(['input_objects'])
+    with rp_debugger.LineTimer("cleanup_step"):
+        rp_cleanup.clean(["input_objects"])
 
     return whisper_results
 

@@ -65,6 +65,7 @@ class Predictor:
         no_speech_threshold=0.6,
         enable_vad=False,
         word_timestamps=False,
+        progress_callback=None,
     ):
         """
         Run a single prediction on the model, loading/unloading models as needed.
@@ -73,6 +74,9 @@ class Predictor:
             raise ValueError(
                 f"Invalid model name: {model_name}. Available models are: {AVAILABLE_MODELS}"
             )
+
+        if progress_callback:
+            progress_callback(5, "Checking model")
 
         with self.model_lock:
             model = None
@@ -95,6 +99,10 @@ class Predictor:
 
                 # Load the requested model
                 print(f"Loading model: {model_name}...")
+
+                if progress_callback:
+                    progress_callback(8, f"Load model {model_name}")
+
                 try:
                     loaded_model = WhisperModel(
                         model_name,
@@ -104,6 +112,10 @@ class Predictor:
                     self.models[model_name] = loaded_model
                     model = loaded_model
                     print(f"Model {model_name} loaded successfully.")
+
+                    if progress_callback:
+                        progress_callback(15, f"Model is {model_name} already")
+
                 except Exception as e:
                     print(f"Error loading model {model_name}: {e}")
                     raise ValueError(f"Failed to load model {model_name}: {e}") from e
@@ -111,6 +123,9 @@ class Predictor:
                 # Model already loaded
                 model = self.models[model_name]
                 print(f"Using already loaded model: {model_name}")
+
+                if progress_callback:
+                    progress_callback(15, f"Model is {model_name} already")
 
             # Ensure model is loaded before proceeding
             if model is None:
@@ -132,47 +147,105 @@ class Predictor:
         # Note: FasterWhisper's transcribe might release the GIL, potentially allowing
         # other threads to acquire the model_lock if transcribe is lengthy.
         # If issues arise, the lock might need to encompass the transcribe call too.
-        segments, info = list(
-            model.transcribe(
-                str(audio),
-                language=language,
-                task="transcribe",
-                beam_size=beam_size,
-                best_of=best_of,
-                patience=patience,
-                length_penalty=length_penalty,
-                temperature=temperature,
-                compression_ratio_threshold=compression_ratio_threshold,
-                log_prob_threshold=logprob_threshold,
-                no_speech_threshold=no_speech_threshold,
-                condition_on_previous_text=condition_on_previous_text,
-                initial_prompt=initial_prompt,
-                prefix=None,
-                suppress_blank=True,
-                suppress_tokens=[-1],  # Might need conversion from string
-                without_timestamps=False,
-                max_initial_timestamp=1.0,
-                word_timestamps=word_timestamps,
-                vad_filter=enable_vad,
-            )
+        segments_generator, info = model.transcribe(
+            str(audio),
+            language=language,
+            task="transcribe",
+            beam_size=beam_size,
+            best_of=best_of,
+            patience=patience,
+            length_penalty=length_penalty,
+            temperature=temperature,
+            compression_ratio_threshold=compression_ratio_threshold,
+            log_prob_threshold=logprob_threshold,
+            no_speech_threshold=no_speech_threshold,
+            condition_on_previous_text=condition_on_previous_text,
+            initial_prompt=initial_prompt,
+            prefix=None,
+            suppress_blank=True,
+            suppress_tokens=[-1],
+            without_timestamps=False,
+            max_initial_timestamp=1.0,
+            word_timestamps=word_timestamps,
+            vad_filter=enable_vad,
         )
 
-        segments = list(segments)
+        segments = []
+        audio_duration = max(float(info.duration or 0.0), 1e-6)
+        last_progress_bucket = 15
+
+        for segment in segments_generator:
+            segments.append(segment)
+
+            ratio = min(
+                max(float(segment.end) / audio_duration, 0.0),
+                1.0,
+            )
+
+            percentage = 15 + int(ratio * 75)
+            bucket = min(90, (percentage // 5) * 5)
+
+            if progress_callback and bucket > last_progress_bucket:
+                progress_callback(bucket, f"Transcription processing {bucket}%")
+                last_progress_bucket = bucket
+
+        if progress_callback:
+            progress_callback(92, "Transcription successfully; arrange of result")
 
         # Format transcription
         transcription_output = format_segments(transcription, segments)
 
         # Handle translation if requested
         translation_output = None
+
+        # Handle translation if requested
+        translation_output = None
+
         if translate:
-            translation_segments, _ = model.transcribe(
+            if progress_callback:
+                progress_callback(93, "Start translation")
+
+            translation_generator, translation_info = model.transcribe(
                 str(audio),
                 task="translate",
-                temperature=temperature,  # Reuse temperature settings for translation
+                temperature=temperature,
             )
+
+            translation_segments = []
+
+            translation_duration = max(
+                float(translation_info.duration or info.duration or 0.0),
+                1e-6,
+            )
+
+            last_translation_progress = 93
+
+            for segment in translation_generator:
+                translation_segments.append(segment)
+
+                ratio = min(
+                    max(
+                        float(segment.end) / translation_duration,
+                        0.0,
+                    ),
+                    1.0,
+                )
+
+                percentage = 93 + int(ratio * 5)
+                percentage = min(98, percentage)
+
+                if progress_callback and percentage >= last_translation_progress + 1:
+                    progress_callback(percentage, f"Translation processing {percentage}%")
+
+                    last_translation_progress = percentage
+
             translation_output = format_segments(
-                translation, list(translation_segments)
+                translation,
+                translation_segments,
             )
+
+            if progress_callback:
+                progress_callback(99, "Translation successfully; arrange of result")
 
         results = {
             "segments": serialize_segments(segments),
