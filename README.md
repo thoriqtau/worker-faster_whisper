@@ -86,3 +86,51 @@ producing an output like this:
   "translation_time": 0.3796223163604736
 }
 ```
+
+## Streaming progress events
+
+The handler is a streaming (generator) handler. It yields events in this order:
+
+| Event | Shape | Description |
+| ----- | ----- | ----------- |
+| `status` | `{"type": "status", "message": "loading model"}` | Emitted before the model is loaded |
+| `status` | `{"type": "status", "message": "transcribing"}` | Emitted before transcription starts |
+| `progress` | `{"type": "progress", "transcribed_until": <float seconds>, "duration": <float seconds>}` | Emitted once per faster-whisper segment; `transcribed_until` is the real position in the audio (from `segment.end`), not an estimate |
+| `result` | `{"type": "result", "output": <final output>}` | Last event; `output` has the exact same shape as the non-streaming worker above |
+
+### Usage
+
+Submit a job with `POST /run`, then poll `GET /stream/{job_id}` to receive
+events as they are produced:
+
+```bash
+JOB_ID=$(curl -s -X POST https://api.runpod.ai/v2/$ENDPOINT_ID/run \
+  -H "authorization: $RUNPOD_API_KEY" -H "content-type: application/json" \
+  -d '{"input": {"audio": "<url>", "model": "base", "transcription": "srt"}}' | jq -r .id)
+
+# poll repeatedly; progress events show transcribed_until increasing
+curl -s https://api.runpod.ai/v2/$ENDPOINT_ID/stream/$JOB_ID -H "authorization: $RUNPOD_API_KEY"
+```
+
+With `return_aggregate_stream` enabled, `/run` and `/runsync` also return the
+complete event list, where the last element contains the final result:
+
+```json
+{
+  "output": [
+    {"type": "status", "message": "loading model"},
+    {"type": "status", "message": "transcribing"},
+    {"type": "progress", "transcribed_until": 5.0, "duration": 10.0},
+    {"type": "progress", "transcribed_until": 10.0, "duration": 10.0},
+    {"type": "result", "output": {"segments": [], "detected_language": "en", "duration": 10.0, "transcription": "...", "translation": null, "device": "cuda", "model": "base"}}
+  ]
+}
+```
+
+### Local testing
+
+```bash
+python rp_handler.py --test_input '{"input": {"audio": "<url>", "model": "base", "transcription": "srt"}}'
+```
+
+Each yielded event is printed as a JSON line in real time.

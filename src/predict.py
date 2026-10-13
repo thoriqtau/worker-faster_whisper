@@ -6,15 +6,11 @@ repository, with some modifications to make it work with the RP platform.
 
 import gc
 import threading
-from concurrent.futures import (
-    ThreadPoolExecutor,
-)  # Still needed for transcribe potentially?
+
 import numpy as np
-
-from runpod.serverless.utils import rp_cuda
-
 from faster_whisper import WhisperModel
 from faster_whisper.utils import format_timestamp
+from runpod.serverless.utils import rp_cuda
 
 # Define available models (for validation)
 AVAILABLE_MODELS = {
@@ -41,9 +37,55 @@ class Predictor:
 
     def setup(self):
         """No models are pre-loaded. Setup is minimal."""
-        pass
 
-    def predict(
+    def get_model(self, model_name):
+        """
+        Return the WhisperModel for the given model name, loading it on
+        first use and caching it in memory so subsequent jobs skip the
+        cold load. Only one model is kept in memory at a time.
+        """
+        if model_name not in AVAILABLE_MODELS:
+            raise ValueError(
+                f"Invalid model name: {model_name}. Available models are: {AVAILABLE_MODELS}"
+            )
+
+        with self.model_lock:
+            if model_name in self.models:
+                print(f"Using already loaded model: {model_name}")
+                return self.models[model_name]
+
+            # Unload existing model if necessary
+            if self.models:
+                existing_model_name = list(self.models.keys())[0]
+                print(f"Unloading model: {existing_model_name}...")
+                # Remove reference and clear dict
+                del self.models[existing_model_name]
+                self.models.clear()
+                # Hint Python to release memory
+                gc.collect()
+                if rp_cuda.is_available():
+                    # If using PyTorch models, you might call torch.cuda.empty_cache()
+                    # FasterWhisper uses CTranslate2; explicit cache clearing might not be needed
+                    # but gc.collect() is generally helpful.
+                    pass
+                print(f"Model {existing_model_name} unloaded.")
+
+            # Load the requested model
+            print(f"Loading model: {model_name}...")
+            try:
+                loaded_model = WhisperModel(
+                    model_name,
+                    device="cuda" if rp_cuda.is_available() else "cpu",
+                    compute_type="float16" if rp_cuda.is_available() else "int8",
+                )
+                self.models[model_name] = loaded_model
+                print(f"Model {model_name} loaded successfully.")
+                return loaded_model
+            except Exception as e:
+                print(f"Error loading model {model_name}: {e}")
+                raise ValueError(f"Failed to load model {model_name}: {e}") from e
+
+    def predict_streaming(
         self,
         audio,
         model_name="base",
@@ -67,60 +109,23 @@ class Predictor:
         word_timestamps=False,
     ):
         """
-        Run a single prediction on the model, loading/unloading models as needed.
+        Run a single prediction on the model, yielding streaming events.
+
+        Event protocol (every event has a "type" key):
+        - {"type": "status", "message": "loading model"}   before model load
+        - {"type": "status", "message": "transcribing"}    before transcribe
+        - {"type": "progress", "transcribed_until": float, "duration": float}
+          once per faster-whisper segment (real position in the audio)
+        - {"type": "result", "output": <final result dict>}  last event
+
+        The final output dict keeps the exact same shape as the previous
+        blocking implementation.
         """
-        if model_name not in AVAILABLE_MODELS:
-            raise ValueError(
-                f"Invalid model name: {model_name}. Available models are: {AVAILABLE_MODELS}"
-            )
+        yield {"type": "status", "message": "loading model"}
 
-        with self.model_lock:
-            model = None
-            if model_name not in self.models:
-                # Unload existing model if necessary
-                if self.models:
-                    existing_model_name = list(self.models.keys())[0]
-                    print(f"Unloading model: {existing_model_name}...")
-                    # Remove reference and clear dict
-                    del self.models[existing_model_name]
-                    self.models.clear()
-                    # Hint Python to release memory
-                    gc.collect()
-                    if rp_cuda.is_available():
-                        # If using PyTorch models, you might call torch.cuda.empty_cache()
-                        # FasterWhisper uses CTranslate2; explicit cache clearing might not be needed
-                        # but gc.collect() is generally helpful.
-                        pass
-                    print(f"Model {existing_model_name} unloaded.")
+        model = self.get_model(model_name)
 
-                # Load the requested model
-                print(f"Loading model: {model_name}...")
-                try:
-                    loaded_model = WhisperModel(
-                        model_name,
-                        device="cuda" if rp_cuda.is_available() else "cpu",
-                        compute_type="float16" if rp_cuda.is_available() else "int8",
-                    )
-                    self.models[model_name] = loaded_model
-                    model = loaded_model
-                    print(f"Model {model_name} loaded successfully.")
-                except Exception as e:
-                    print(f"Error loading model {model_name}: {e}")
-                    raise ValueError(f"Failed to load model {model_name}: {e}") from e
-            else:
-                # Model already loaded
-                model = self.models[model_name]
-                print(f"Using already loaded model: {model_name}")
-
-            # Ensure model is loaded before proceeding
-            if model is None:
-                raise RuntimeError(
-                    f"Model {model_name} could not be loaded or retrieved."
-                )
-
-        # Model is now loaded and ready, proceed with prediction (outside the lock?)
-        # Consider if transcribe is thread-safe or if it should also be within the lock
-        # For now, keeping transcribe outside as it's CPU/GPU bound work
+        yield {"type": "status", "message": "transcribing"}
 
         if temperature_increment_on_fallback is not None:
             temperature = tuple(
@@ -129,35 +134,42 @@ class Predictor:
         else:
             temperature = [temperature]
 
-        # Note: FasterWhisper's transcribe might release the GIL, potentially allowing
-        # other threads to acquire the model_lock if transcribe is lengthy.
-        # If issues arise, the lock might need to encompass the transcribe call too.
-        segments, info = list(
-            model.transcribe(
-                str(audio),
-                language=language,
-                task="transcribe",
-                beam_size=beam_size,
-                best_of=best_of,
-                patience=patience,
-                length_penalty=length_penalty,
-                temperature=temperature,
-                compression_ratio_threshold=compression_ratio_threshold,
-                log_prob_threshold=logprob_threshold,
-                no_speech_threshold=no_speech_threshold,
-                condition_on_previous_text=condition_on_previous_text,
-                initial_prompt=initial_prompt,
-                prefix=None,
-                suppress_blank=True,
-                suppress_tokens=[-1],  # Might need conversion from string
-                without_timestamps=False,
-                max_initial_timestamp=1.0,
-                word_timestamps=word_timestamps,
-                vad_filter=enable_vad,
-            )
+        # model.transcribe returns a lazy generator; the transcription only
+        # actually runs while we iterate over it, so progress events can be
+        # yielded per segment in real time.
+        segments_iter, info = model.transcribe(
+            str(audio),
+            language=language,
+            task="transcribe",
+            beam_size=beam_size,
+            best_of=best_of,
+            patience=patience,
+            length_penalty=length_penalty,
+            temperature=temperature,
+            compression_ratio_threshold=compression_ratio_threshold,
+            log_prob_threshold=logprob_threshold,
+            no_speech_threshold=no_speech_threshold,
+            condition_on_previous_text=condition_on_previous_text,
+            initial_prompt=initial_prompt,
+            prefix=None,
+            suppress_blank=True,
+            suppress_tokens=[-1],  # Might need conversion from string
+            without_timestamps=False,
+            max_initial_timestamp=1.0,
+            word_timestamps=word_timestamps,
+            vad_filter=enable_vad,
         )
 
-        segments = list(segments)
+        duration = float(info.duration or 0.0)
+
+        segments = []
+        for seg in segments_iter:
+            segments.append(seg)
+            yield {
+                "type": "progress",
+                "transcribed_until": float(seg.end),
+                "duration": duration,
+            }
 
         # Format transcription
         transcription_output = format_segments(transcription, segments)
@@ -197,7 +209,7 @@ class Predictor:
                     )
             results["word_timestamps"] = word_timestamps_list
 
-        return results
+        yield {"type": "result", "output": results}
 
 
 def serialize_segments(transcript):
